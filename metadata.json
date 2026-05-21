@@ -1,0 +1,6 @@
+{
+  "name": "Facial Attendance Recognition System (PCA & LDA)",
+  "description": "A live facial recognition attendance system for students utilizing Principal Component Analysis (PCA - Eigenfaces) and Linear Discriminant Analysis (LDA - Fisherfaces) with automated attendance logging and admin controls.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
