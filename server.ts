@@ -1,10 +1,9 @@
 import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
-import mongoose from "mongoose";
 import { MongoClient } from 'mongodb';
 
-// Load environment variables
+// Load environment variables (local dev only)
 dotenv.config();
 
 const app = express();
@@ -13,116 +12,106 @@ const PORT = 3000;
 // Enable large JSON bodies for facial capture vectors
 app.use(express.json({ limit: '20mb' }));
 
-// --- IN-MEMORY TEMPORARY STORAGE ---
-// These act as a fully functional local development state if MongoDB is not connected
+// --- IN-MEMORY FALLBACK (local dev only) ---
 let localStudents: any[] = [];
 let localAttendance: any[] = [];
 let localAdmins: any[] = [
   { username: 'admin', passwordKey: 'password' }
 ];
-const uri = process.env.MONGODB_URI;
 
-if (!uri) {
-  throw new Error("MONGODB_URI is missing");
+const dbName = 'attendance_db';
+
+// --- MONGODB CONNECTION ---
+// Cached across warm Vercel invocations
+let mongoClient: MongoClient | null = null;
+let mongoConnectionPromise: Promise<MongoClient | null> | null = null;
+
+function getUri(): string | null {
+  const raw = process.env.MONGODB_URI;
+  if (!raw) return null;
+  return raw.trim().replace(/^['"]|['"]$/g, '').trim() || null;
 }
 
-mongoose.connect(uri);
-// --- MONGODB CONNECTION POOL COUPLER ---
-const dbName = 'attendance_db';
-let mongoClient: MongoClient | null = null;
-let isMongoConnected = false;
-let mongoError: string | null = null;
-
-// Mask real MongoDB password parts for UI diagnostics
 function maskUri(uri: string): string {
   try {
-    const matches = uri.match(/^(mongodb(?:\+srv)?:\/\/)([^:]+):([^@]+)@(.+)$/);
-    if (matches) {
-      const [, proto, user, , rest] = matches;
-      return `${proto}${user}:******@${rest}`;
-    }
-    return "mongodb+srv://******... (Configured)";
-  } catch (e) {
-    return "Configured URI (Masked)";
+    const m = uri.match(/^(mongodb(?:\+srv)?:\/\/)([^:]+):([^@]+)@(.+)$/);
+    if (m) return `${m[1]}${m[2]}:******@${m[4]}`;
+    return 'mongodb+srv://******... (Configured)';
+  } catch {
+    return 'Configured URI (Masked)';
   }
 }
-
-let activeUri: string | null = null;
-let mongoConnectionPromise: Promise<MongoClient | null> | null = null;
 
 async function connectToMongo(uri: string): Promise<MongoClient | null> {
   try {
-    console.log("Attempting background connection to MongoDB...");
-    const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
+    console.log('Connecting to MongoDB...');
+    const client = new MongoClient(uri, {
+      serverSelectionTimeoutMS: 10000, // 10s — gives Vercel cold starts enough time
+      connectTimeoutMS: 10000,
+    });
     await client.connect();
-    
+
+    // Verify the connection is actually alive
+    await client.db('admin').command({ ping: 1 });
+
     // Seed default admin if none exists
     const db = client.db(dbName);
-    const count = await db.collection('admins').countDocuments();
-    if (count === 0) {
+    const adminCount = await db.collection('admins').countDocuments();
+    if (adminCount === 0) {
       await db.collection('admins').insertOne({ username: 'admin', passwordKey: 'password' });
     }
-    
+
     mongoClient = client;
-    isMongoConnected = true;
-    mongoError = null;
-    console.log("Successfully connected to MongoDB Cluster.");
+    console.log('Successfully connected to MongoDB.');
     return client;
   } catch (err: any) {
-    isMongoConnected = false;
-    mongoError = err?.message || String(err);
-    console.error("Failed to connect to MongoDB:", err);
-    mongoConnectionPromise = null; // reset promise so next request attempts connection
+    console.error('MongoDB connection failed:', err?.message || err);
+    mongoClient = null;
+    mongoConnectionPromise = null; // Allow retry on next request
     return null;
   }
 }
 
-async function getMongoClient() {
-  if (!process.env.VERCEL) {
-    try {
-      dotenv.config({ override: true });
-    } catch (e) {
-      console.warn("Failed to dynamically reload dotenv:", e);
-    }
-  }
+async function getMongoClient(): Promise<MongoClient | null> {
+  const uri = getUri();
 
-  let currentUri = process.env.MONGODB_URI;
-  if (currentUri) {
-    currentUri = currentUri.trim().replace(/^['"]|['"]$/g, '').trim();
-  }
-
-  if (currentUri !== activeUri) {
-    if (mongoClient) {
-      try {
-        await mongoClient.close();
-      } catch (e) {}
-      mongoClient = null;
-    }
-    isMongoConnected = false;
-    mongoConnectionPromise = null;
-    activeUri = currentUri || null;
-  }
-
-  if (isMongoConnected && mongoClient) {
-    return mongoClient;
-  }
-  if (!currentUri) {
-    isMongoConnected = false;
-    mongoError = 'MONGODB_URI environment variable is not defined';
+  if (!uri) {
+    console.error('MONGODB_URI is not set.');
     return null;
   }
 
+  // Return cached client if alive
+  if (mongoClient) {
+    try {
+      await mongoClient.db('admin').command({ ping: 1 });
+      return mongoClient;
+    } catch {
+      // Client died — reset and reconnect
+      console.warn('MongoDB client ping failed, reconnecting...');
+      mongoClient = null;
+      mongoConnectionPromise = null;
+    }
+  }
+
+  // Deduplicate concurrent connection attempts
   if (!mongoConnectionPromise) {
-    mongoConnectionPromise = connectToMongo(currentUri);
+    mongoConnectionPromise = connectToMongo(uri);
   }
 
   return mongoConnectionPromise;
 }
 
-// Fire initial connection test in the background
-getMongoClient().catch(err => {
-  console.log("Initial connection attempt parsed. Operating in memory sandbox until loaded.");
-});
+// Warm up connection at startup (non-Vercel)
+if (!process.env.VERCEL) {
+  getMongoClient().catch(() => {
+    console.warn('Startup connection failed. Will retry per-request.');
+  });
+}
+
+// Helper: true if we have a live DB client
+function isConnected(client: MongoClient | null): client is MongoClient {
+  return client !== null;
+}
 
 // --- API ENDPOINTS ---
 
@@ -130,19 +119,14 @@ getMongoClient().catch(err => {
 app.get('/api/data', async (req, res) => {
   try {
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
+    if (isConnected(client)) {
       const db = client.db(dbName);
-      const students = await db.collection('students').find({}).toArray();
-      const attendance = await db.collection('attendance').find({}).toArray();
-      const admins = await db.collection('admins').find({}).toArray();
-      res.json({
-        success: true,
-        students,
-        attendance,
-        admins,
-        mongoConnected: true,
-        usingMemory: false
-      });
+      const [students, attendance, admins] = await Promise.all([
+        db.collection('students').find({}).toArray(),
+        db.collection('attendance').find({}).toArray(),
+        db.collection('admins').find({}).toArray(),
+      ]);
+      res.json({ success: true, students, attendance, admins, mongoConnected: true, usingMemory: false });
     } else {
       res.json({
         success: true,
@@ -150,30 +134,25 @@ app.get('/api/data', async (req, res) => {
         attendance: localAttendance,
         admins: localAdmins,
         mongoConnected: false,
-        usingMemory: true
+        usingMemory: true,
       });
     }
   } catch (error: any) {
     console.error('Error fetching unified dataset:', error);
-    res.status(500).json({ success: false, error: 'Database unified retrieval failed', details: error.message });
+    res.status(500).json({ success: false, error: 'Database retrieval failed', details: error.message });
   }
 });
 
-// Check database connection status live
+// Check database connection status
 app.get('/api/db-status', async (req, res) => {
-  let currentUri = process.env.MONGODB_URI;
-  if (currentUri) {
-    currentUri = currentUri.trim().replace(/^['"]|['"]$/g, '').trim();
-  }
-  if (currentUri && !isMongoConnected) {
-    await getMongoClient();
-  }
+  const uri = getUri();
+  const client = uri ? await getMongoClient() : null;
+  const connected = isConnected(client);
   res.json({
-    connected: isMongoConnected,
-    provider: isMongoConnected ? 'MongoDB Atlas (Live Cluster)' : 'Local In-Memory Cache',
-    hasUri: !!currentUri,
-    error: mongoError,
-    uriMasked: currentUri ? maskUri(currentUri) : null
+    connected,
+    provider: connected ? 'MongoDB Atlas (Live)' : 'Local In-Memory Cache',
+    hasUri: !!uri,
+    uriMasked: uri ? maskUri(uri) : null,
   });
 });
 
@@ -181,9 +160,8 @@ app.get('/api/db-status', async (req, res) => {
 app.get('/api/students', async (req, res) => {
   try {
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
-      const db = client.db(dbName);
-      const students = await db.collection('students').find({}).toArray();
+    if (isConnected(client)) {
+      const students = await client.db(dbName).collection('students').find({}).toArray();
       res.json(students);
     } else {
       res.json(localStudents);
@@ -198,31 +176,22 @@ app.get('/api/students', async (req, res) => {
 app.post('/api/students', async (req, res) => {
   try {
     const student = req.body;
-    if (!student || !student.studentId) {
+    if (!student?.studentId) {
       res.status(400).json({ error: 'Invalid student schema' });
       return;
     }
-    const studentIdNormalized = student.studentId.trim().toUpperCase();
+    const idNorm = student.studentId.trim().toUpperCase();
 
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
-      const db = client.db(dbName);
-      const duplicate = await db.collection('students').findOne({
-        studentId: { $regex: new RegExp(`^${studentIdNormalized}$`, 'i') }
-      });
-      if (duplicate) {
-        res.status(400).json({ error: 'Matriculation number already registered' });
-        return;
-      }
-      await db.collection('students').insertOne(student);
+    if (isConnected(client)) {
+      const col = client.db(dbName).collection('students');
+      const duplicate = await col.findOne({ studentId: { $regex: new RegExp(`^${idNorm}$`, 'i') } });
+      if (duplicate) { res.status(400).json({ error: 'Matriculation number already registered' }); return; }
+      await col.insertOne(student);
       res.status(201).json({ success: true, student });
     } else {
-      const duplicate = localStudents.some(
-        s => s.studentId.toUpperCase() === studentIdNormalized
-      );
-      if (duplicate) {
-        res.status(400).json({ error: 'Matriculation number already registered' });
-        return;
+      if (localStudents.some(s => s.studentId.toUpperCase() === idNorm)) {
+        res.status(400).json({ error: 'Matriculation number already registered' }); return;
       }
       localStudents.push(student);
       res.status(201).json({ success: true, student });
@@ -233,19 +202,16 @@ app.post('/api/students', async (req, res) => {
   }
 });
 
-// DELETE standard student
+// DELETE student
 app.delete('/api/students/:id', async (req, res) => {
   try {
-    const idToDelete = req.params.id;
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
-      const db = client.db(dbName);
-      await db.collection('students').deleteOne({ id: idToDelete });
-      res.json({ success: true });
+    if (isConnected(client)) {
+      await client.db(dbName).collection('students').deleteOne({ id: req.params.id });
     } else {
-      localStudents = localStudents.filter(s => s.id !== idToDelete);
-      res.json({ success: true });
+      localStudents = localStudents.filter(s => s.id !== req.params.id);
     }
+    res.json({ success: true });
   } catch (error) {
     console.error('Error deleting student:', error);
     res.status(500).json({ error: 'Failed to delete student' });
@@ -256,14 +222,12 @@ app.delete('/api/students/:id', async (req, res) => {
 app.post('/api/students/clear', async (req, res) => {
   try {
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
-      const db = client.db(dbName);
-      await db.collection('students').deleteMany({});
-      res.json({ success: true });
+    if (isConnected(client)) {
+      await client.db(dbName).collection('students').deleteMany({});
     } else {
       localStudents = [];
-      res.json({ success: true });
     }
+    res.json({ success: true });
   } catch (error) {
     console.error('Error clearing students:', error);
     res.status(500).json({ error: 'Error clearing students' });
@@ -273,22 +237,20 @@ app.post('/api/students/clear', async (req, res) => {
 // GET all attendance logs
 app.get('/api/attendance', async (req, res) => {
   try {
-    let attendance = [];
+    let attendance: any[] = [];
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
-      const db = client.db(dbName);
-      attendance = await db.collection('attendance').find({}).toArray();
+    if (isConnected(client)) {
+      attendance = await client.db(dbName).collection('attendance').find({}).toArray();
     } else {
       attendance = localAttendance;
     }
     const sorted = [...attendance].sort((a, b) => {
-      const dateCompare = (b.date || '').localeCompare(a.date || '');
-      if (dateCompare !== 0) return dateCompare;
-      return (b.time || '').localeCompare(a.time || '');
+      const d = (b.date || '').localeCompare(a.date || '');
+      return d !== 0 ? d : (b.time || '').localeCompare(a.time || '');
     });
     res.json(sorted);
   } catch (e) {
-    console.error('Error fetching attendance logs:', e);
+    console.error('Error fetching attendance:', e);
     res.status(500).json([]);
   }
 });
@@ -297,31 +259,20 @@ app.get('/api/attendance', async (req, res) => {
 app.post('/api/attendance', async (req, res) => {
   try {
     const record = req.body;
-    if (!record || !record.studentId) {
-      res.status(400).json({ error: 'Invalid attendance schema' });
-      return;
+    if (!record?.studentId) {
+      res.status(400).json({ error: 'Invalid attendance schema' }); return;
     }
 
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
-      const db = client.db(dbName);
-      const isDuplicate = await db.collection('attendance').findOne({
-        studentId: record.studentId,
-        date: record.date
-      });
-      if (isDuplicate) {
-        res.json({ success: true, info: 'Attendance already recorded for today' });
-        return;
-      }
-      await db.collection('attendance').insertOne(record);
+    if (isConnected(client)) {
+      const col = client.db(dbName).collection('attendance');
+      const isDuplicate = await col.findOne({ studentId: record.studentId, date: record.date });
+      if (isDuplicate) { res.json({ success: true, info: 'Attendance already recorded for today' }); return; }
+      await col.insertOne(record);
       res.status(201).json({ success: true, record });
     } else {
-      const isDuplicate = localAttendance.some(
-        r => r.studentId === record.studentId && r.date === record.date
-      );
-      if (isDuplicate) {
-        res.json({ success: true, info: 'Attendance already recorded for today' });
-        return;
+      if (localAttendance.some(r => r.studentId === record.studentId && r.date === record.date)) {
+        res.json({ success: true, info: 'Attendance already recorded for today' }); return;
       }
       localAttendance.unshift(record);
       res.status(201).json({ success: true, record });
@@ -332,18 +283,16 @@ app.post('/api/attendance', async (req, res) => {
   }
 });
 
-// POST clear all attendance records
+// POST clear all attendance
 app.post('/api/attendance/clear', async (req, res) => {
   try {
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
-      const db = client.db(dbName);
-      await db.collection('attendance').deleteMany({});
-      res.json({ success: true });
+    if (isConnected(client)) {
+      await client.db(dbName).collection('attendance').deleteMany({});
     } else {
       localAttendance = [];
-      res.json({ success: true });
     }
+    res.json({ success: true });
   } catch (error) {
     console.error('Error clearing attendance:', error);
     res.status(500).json({ error: 'Error clearing logs' });
@@ -354,9 +303,8 @@ app.post('/api/attendance/clear', async (req, res) => {
 app.get('/api/admins', async (req, res) => {
   try {
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
-      const db = client.db(dbName);
-      const admins = await db.collection('admins').find({}).toArray();
+    if (isConnected(client)) {
+      const admins = await client.db(dbName).collection('admins').find({}).toArray();
       res.json(admins);
     } else {
       res.json(localAdmins);
@@ -372,41 +320,33 @@ app.post('/api/admins', async (req, res) => {
   try {
     const { username, passwordKey } = req.body;
     if (!username || !passwordKey) {
-      res.status(400).json({ error: 'Missing required credentials' });
-      return;
+      res.status(400).json({ error: 'Missing required credentials' }); return;
     }
     const usernameNorm = username.trim().toLowerCase();
 
     const client = await getMongoClient();
-    if (isMongoConnected && client) {
-      const db = client.db(dbName);
-      const duplicate = await db.collection('admins').findOne({
-        username: { $regex: new RegExp(`^${usernameNorm}$`, 'i') }
-      });
-      if (duplicate) {
-        res.status(400).json({ error: 'Administrator username already exists' });
-        return;
-      }
+    if (isConnected(client)) {
+      const col = client.db(dbName).collection('admins');
+      const duplicate = await col.findOne({ username: { $regex: new RegExp(`^${usernameNorm}$`, 'i') } });
+      if (duplicate) { res.status(400).json({ error: 'Administrator username already exists' }); return; }
       const newAdmin = { username: username.trim(), passwordKey };
-      await db.collection('admins').insertOne(newAdmin);
+      await col.insertOne(newAdmin);
       res.status(201).json({ success: true, admin: newAdmin });
     } else {
-      const duplicate = localAdmins.some(a => a.username.toLowerCase() === usernameNorm);
-      if (duplicate) {
-        res.status(400).json({ error: 'Administrator username already exists' });
-        return;
+      if (localAdmins.some(a => a.username.toLowerCase() === usernameNorm)) {
+        res.status(400).json({ error: 'Administrator username already exists' }); return;
       }
       const newAdmin = { username: username.trim(), passwordKey };
       localAdmins.push(newAdmin);
       res.status(201).json({ success: true, admin: newAdmin });
     }
   } catch (error) {
-    console.error('Error adding administrator account:', error);
+    console.error('Error adding admin:', error);
     res.status(500).json({ error: 'Error adding administrator account' });
   }
 });
 
-// Start server and mount Vite
+// --- START SERVER ---
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -418,15 +358,12 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   }
 
-  // Only listen if not running in the Vercel backend serverless function
   if (!process.env.VERCEL) {
     app.listen(PORT, '0.0.0.0', () => {
-      console.log(`Express server listening on http://0.0.0.0:${PORT}`);
+      console.log(`Server running at http://0.0.0.0:${PORT}`);
     });
   }
 }
